@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint-test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 装 Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: 装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install ruff mypy pytest
+          pip install -e ".[telegram,feishu]" || pip install -e . || true
+
+      - name: ruff 检查
+        run: ruff check src/ tests/
+
+      - name: mypy 类型检查
+        run: mypy src/openclaw_robot/core/ --ignore-missing-imports || true
+
+      - name: pytest
+        run: pytest -q

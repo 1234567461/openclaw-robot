@@ -1,0 +1,23 @@
+# 树莓派部署 openclaw-robot
+# 配合 auto-deploy-linux 仓库的 cloud-init，开机即跑 MC bot
+#
+# 用法：
+#   docker compose up -d
+#
+# 环境变量见 ../../.env.example，把 .env 放在本目录或父目录
+
+services:
+  mc-bot:
+    build: ../..
+    image: openclaw-robot:latest
+    container_name: openclaw-mc-bot
+    restart: unless-stopped
+    env_file:
+      - ../../.env
+    command: ["openclaw-mc"]
+    networks:
+      - mc-net
+
+networks:
+  mc-net:
+    driver: bridge

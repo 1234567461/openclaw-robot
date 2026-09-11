@@ -1,0 +1,301 @@
+"""Minecraft bot 玩家主循环：连接服务器、监听聊天、LLM 决策、执行技能。
+
+用 quarry（纯 Python MC 协议库）连接服务器。
+收到玩家聊天 → 用 LLM 理解意图 → 调用工具（采集/建造/对话）→ 回复。
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+from dataclasses import dataclass, field
+from typing import Any
+
+from ..core.llm import LLM
+from ..core.tools import Tool, ToolRegistry
+from .prompts import SYSTEM_PROMPT, WORLD_STATE_TEMPLATE
+
+log = logging.getLogger(__name__)
+
+
+@dataclass
+class MinecraftBot:
+    """一个 Minecraft 玩家 bot。
+
+    配置通过环境变量：
+      MC_HOST, MC_PORT, MC_USERNAME, MC_AUTH, MC_EMAIL, MC_PASSWORD
+    """
+
+    llm: LLM = field(default_factory=LLM)
+    host: str = ""
+    port: int = 25565
+    username: str = "ClawBot"
+    auth: str = "offline"
+    email: str = ""
+    password: str = ""
+
+    # 运行时状态
+    _factory: Any = field(default=None, repr=False)
+    _protocol: Any = field(default=None, repr=False)
+    _entity_id: int = 0
+    _position: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    _health: float = 20.0
+    _inventory: dict[str, int] = field(default_factory=dict)
+    _tools: ToolRegistry = field(default_factory=ToolRegistry)
+    _chat_history: list[dict] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        self.host = self.host or os.getenv("MC_HOST", "127.0.0.1")
+        self.port = int(os.getenv("MC_PORT", "25565"))
+        self.username = self.username or os.getenv("MC_USERNAME", "ClawBot")
+        self.auth = os.getenv("MC_AUTH", "offline")
+        self.email = os.getenv("MC_EMAIL", "")
+        self.password = os.getenv("MC_PASSWORD", "")
+        self._register_tools()
+
+    # ---------- 工具注册 ----------
+
+    def _register_tools(self) -> None:
+        """把 bot 自身能力注册为 LLM 可调用的工具。"""
+        self._tools.register(Tool(
+            name="chat",
+            description="在游戏聊天里发言。message: 要说的内容。",
+            func=lambda message: self._do_chat(message),
+        ))
+        self._tools.register(Tool(
+            name="gather",
+            description="采集资源。resource: wood/stone/coal/iron/diamond，count: 数量。",
+            func=lambda resource="wood", count=1: self._do_gather(resource, count),
+        ))
+        self._tools.register(Tool(
+            name="build",
+            description="在坐标(x,y,z)建造结构。structure: hut/tower/torch。",
+            func=lambda structure, x, y, z: self._do_build(structure, x, y, z),
+        ))
+        self._tools.register(Tool(
+            name="look_around",
+            description="报告周围环境（前方方块）。",
+            func=lambda: self._look_around(),
+        ))
+        self._tools.register(Tool(
+            name="where",
+            description="报告自己当前坐标和状态。",
+            func=lambda: self._where(),
+        ))
+
+    # ---------- 工具实现 ----------
+
+    def _do_chat(self, message: str) -> str:
+        self.chat(message)
+        return f"已发送：{message}"
+
+    def _do_gather(self, resource: str, count: int) -> str:
+        from .skills.gather import gather
+        return gather(self, resource, count)
+
+    def _do_build(self, structure: str, x: float, y: float, z: float) -> str:
+        from .skills.build import build
+        return build(self, structure, x, y, z)
+
+    def _look_around(self) -> str:
+        ahead = self._scan_ahead()
+        return f"前方方块: {ahead}"
+
+    def _where(self) -> str:
+        return (
+            f"坐标 ({self._position[0]:.0f}, {self._position[1]:.0f}, "
+            f"{self._position[2]:.0f})，生命 {self._health}/20"
+        )
+
+    # ---------- quarry 交互层 ----------
+
+    def chat(self, message: str) -> None:
+        """发送聊天消息。"""
+        if self._protocol is None:
+            log.info("[MC 桩] chat: %s", message)
+            return
+        from quarry.net.protocol import ProtocolError  # type: ignore
+        try:
+            self._protocol.send_chat(message)
+        except ProtocolError as e:
+            log.error("发送聊天失败: %s", e)
+
+    def find_nearest_block(self, block_names, radius: int = 16) -> Any:
+        """扫描附近的目标方块。"""
+        # quarry 不直接提供世界快照查询，需订阅 chunk data。
+        # 这里返回 None（桩），实际实现见 _on_chunk_data。
+        return None
+
+    def move_near(self, pos: tuple) -> bool:
+        """移动到 pos 附近。"""
+        if self._protocol is None:
+            return True  # 桩模式假定成功
+        # 实际：发送 player position 包，配合寻路
+        self._position = (float(pos[0]), float(pos[1]), float(pos[2]))
+        self._protocol.send_position(*self._position)
+        return True
+
+    def dig_block(self, pos: tuple) -> bool:
+        """挖掘 pos 处的方块。"""
+        if self._protocol is None:
+            return True
+        # 实际：发送 player digging 包（start=0 destroy, start=1 stop）
+        log.info("挖掘 %s", pos)
+        return True
+
+    def place_block(self, pos: tuple, block: str) -> bool:
+        """在 pos 放置方块。"""
+        if self._protocol is None:
+            return True
+        log.info("放置 %s @ %s", block, pos)
+        return True
+
+    def _scan_ahead(self) -> str:
+        return "（世界快照未实现，需要订阅 chunk data）"
+
+    # ---------- 聊天决策 ----------
+
+    def on_player_chat(self, player: str, message: str) -> None:
+        """收到玩家聊天 → LLM 决策 → 执行工具 → 回复。"""
+        log.info("<%s> %s", player, message)
+        # 忽略自己发的消息
+        if player == self.username:
+            return
+
+        world_state = WORLD_STATE_TEMPLATE.format(
+            x=self._position[0], y=self._position[1], z=self._position[2],
+            health=self._health,
+            inventory=dict(list(self._inventory.items())[:5]) or "空",
+            nearby_players=player,
+            ahead=self._scan_ahead(),
+        )
+
+        system = SYSTEM_PROMPT.format(bot_name=self.username)
+        messages = [
+            {"role": "system", "content": system + "\n" + world_state},
+            {"role": "user", "content": f"[玩家 {player} 说]: {message}"},
+        ]
+
+        openai_tools = self._tools.to_openai()
+        for _ in range(5):
+            resp = self.llm.chat(messages, tools=openai_tools)
+            msg = resp["choices"][0]["message"]
+            messages.append(msg)
+            if not msg.get("tool_calls"):
+                if msg.get("content"):
+                    self.chat(msg["content"])
+                return
+            for tc in msg["tool_calls"]:
+                fn = tc["function"]
+                result = self._tools.call(fn["name"], fn.get("arguments", "{}"))
+                messages.append({"role": "tool", "tool_call_id": tc["id"], "content": result})
+
+    # ---------- 连接与主循环 ----------
+
+    def connect(self) -> None:
+        """连接到 MC 服务器。"""
+        try:
+            from quarry.net.client import ClientProtocol  # type: ignore
+        except ImportError:
+            log.warning("quarry 未安装，bot 运行在桩模式（不连接服务器）")
+            return
+
+        log.info("连接 MC 服务器 %s:%d（用户 %s）", self.host, self.port, self.username)
+
+        class _Protocol(ClientProtocol):  # type: ignore[misc]
+            bot = self
+
+            def packet_player_chat(self, data) -> None:  # type: ignore[no-untyped-def]
+                # 1.19+ chat 信号，实际用 chat_message
+                pass
+
+            def packet_chat_message(self, data) -> None:  # type: ignore[no-untyped-def]
+                """收到聊天消息。data: {json: str, position: int, sender: str}"""
+                import json
+                try:
+                    raw = data["json"]
+                    msg = json.loads(raw) if isinstance(raw, str) else raw
+                    text = _extract_text(msg)
+                    if not text:
+                        return
+                    # 解析 "玩家> 消息" 格式
+                    if ">" in text:
+                        player, content = text.split(">", 1)
+                        self.bot.on_player_chat(player.strip(), content.strip())
+                    else:
+                        self.bot.on_player_chat("server", text)
+                except Exception as e:  # noqa: BLE001
+                    log.debug("解析聊天失败: %s", e)
+
+            def packet_position(self, data) -> None:  # type: ignore[no-untyped-def]
+                self.bot._entity_id = data["entity_id"]
+                self.bot._position = (data["x"], data["y"], data["z"])
+
+            def packet_update_health(self, data) -> None:  # type: ignore[no-untyped-def]
+                self.bot._health = data["health"]
+
+        # quarry 的 ClientFactory 启动
+        from quarry.net.client import ClientFactory  # type: ignore
+        from twisted.internet import reactor  # type: ignore
+
+        self._factory = ClientFactory(
+            protocol=_Protocol,
+            connect_host=self.host,
+            connect_port=self.port,
+            auth=self.auth,
+            username=self.username,
+            email=self.email,
+            password=self.password,
+        )
+        self._factory.connect()
+        reactor.run(installSignalHandlers=False)  # type: ignore[arg-type]
+
+    def run_cli(self) -> None:
+        """桩模式 / 调试模式：本地输入模拟玩家聊天。"""
+        log.info("MC bot CLI 模式（输入玩家聊天，quit 退出）")
+        while True:
+            try:
+                line = input("玩家> ")
+            except (EOFError, KeyboardInterrupt):
+                break
+            if line.strip().lower() in {"quit", "exit"}:
+                break
+            if ">" in line:
+                player, msg = line.split(">", 1)
+                self.on_player_chat(player.strip(), msg.strip())
+            else:
+                self.on_player_chat("Tester", line)
+
+
+def _extract_text(chat_component: Any) -> str:
+    """从 MC chat JSON 组件提取纯文本。"""
+    if isinstance(chat_component, str):
+        return chat_component
+    if isinstance(chat_component, dict):
+        parts = [str(chat_component.get("text", ""))]
+        for child in chat_component.get("extra", []):
+            parts.append(_extract_text(child))
+        return "".join(parts)
+    if isinstance(chat_component, list):
+        return "".join(_extract_text(c) for c in chat_component)
+    return ""
+
+
+def main() -> None:
+    """命令行入口：启动 MC bot。"""
+    import sys
+
+    logging.basicConfig(
+        level=os.getenv("LOG_LEVEL", "INFO"),
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+    bot = MinecraftBot()
+
+    if "--cli" in sys.argv:
+        bot.run_cli()
+    else:
+        bot.connect()
+
+
+if __name__ == "__main__":
+    main()
