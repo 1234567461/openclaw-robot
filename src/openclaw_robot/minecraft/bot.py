@@ -377,12 +377,16 @@ def _block_id_to_name(block_id: int) -> str:
 def _parse_chunk(world: World, data: Any) -> None:
     """解析 chunk data 包，把方块写入 world。
 
-    quarry 的 chunk data 结构随协议版本变化较大，
-    这里做一个通用解析：尝试从 sections 提取 palette + states。
-    未命中已知格式时静默跳过（World 会渐进式填充）。
+    支持 Minecraft 1.18+ 的 chunk column 格式：
+      sections: [{palette: [...], data: [64-bit longs]}, ...]
+    palette 是方块状态表，data 是 packed bit array（每个值索引 palette）。
+
+    解析出的每个方块按 (x, y, z) 写入 world；air 会被自动忽略。
+    协议版本差异导致结构不匹配时静默跳过，后续 block_change 会增量更新。
     """
-    # 尝试 1.18+ 的 chunk 格式
-    sections = data.get("sections") or data.get("chunk") if isinstance(data, dict) else None
+    if not isinstance(data, dict):
+        return
+    sections = data.get("sections")
     if not sections:
         return
 
@@ -390,21 +394,65 @@ def _parse_chunk(world: World, data: Any) -> None:
     chunk_z = data.get("chunk_z", data.get("z", 0))
 
     for sec_idx, section in enumerate(sections):
-        palette = section.get("palette") if isinstance(section, dict) else None
-        if not palette:
+        if not isinstance(section, dict):
             continue
-        block_states = section.get("block_states") or section.get("states")
-        if block_states is None:
+        palette = section.get("palette")
+        block_states = section.get("data") or section.get("block_states") or section.get("states")
+        if not palette or block_states is None:
             continue
 
-        # palette 是方块名列表
-        for block_name in palette:
-            if isinstance(block_name, str):
-                base_y = sec_idx * 16
-                # 若有 explicit 坐标信息则用，否则按序号推算
-                # 这里只记录 palette 存在，精确坐标需解析 packed states
-                _ = (chunk_x, base_y, chunk_z, block_name)
-        # 简化：不做完整 packed states 解析，依赖后续 block_change 增量更新
+        bits_per = max(4, _ceil_log2(len(palette)))
+        states = _unpack_packed(block_states, bits_per, 16 * 16 * 16)
+        base_y = sec_idx * 16
+
+        for i, state_id in enumerate(states):
+            if state_id >= len(palette):
+                continue
+            name = palette[state_id]
+            if isinstance(name, dict):
+                name = name.get("name")
+            if not isinstance(name, str) or not name:
+                continue
+            local_x = i & 0x0F
+            local_z = (i >> 4) & 0x0F
+            local_y = (i >> 8) & 0x0F
+            world.set_block(
+                chunk_x * 16 + local_x,
+                base_y + local_y,
+                chunk_z * 16 + local_z,
+                name,
+            )
+
+
+def _ceil_log2(n: int) -> int:
+    """返回 ceil(log2(n))，n>=1。"""
+    if n <= 1:
+        return 0
+    return (n - 1).bit_length()
+
+
+def _unpack_packed(data: list[int], bits_per: int, count: int) -> list[int]:
+    """把 64-bit long 数组解码为 count 个 bits_per 位的无符号值。
+
+    Minecraft packed array 规则：每个 long 装 floor(64 / bits_per) 个值，
+    从最低位开始，剩余高位忽略（值不跨 long 边界）。
+    palette 大小通常是 2 的幂，bits_per = 4/8/16 等，都整除 64。
+    """
+    if bits_per <= 0:
+        return []
+    mask = (1 << bits_per) - 1
+    values_per_long = 64 // bits_per
+    result: list[int] = []
+    for word in data:
+        word &= 0xFFFFFFFFFFFFFFFF
+        for i in range(values_per_long):
+            if len(result) >= count:
+                break
+            result.append((word >> (i * bits_per)) & mask)
+    # 数据不完整时补 0
+    while len(result) < count:
+        result.append(0)
+    return result
 
 
 def main() -> None:

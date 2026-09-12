@@ -195,16 +195,17 @@ docker compose up -d
 - [x] MC 技能骨架：采集 / 建造 / 对话
 - [x] **Web 聊天渠道**（FastAPI + WebSocket + 前端页面）
 - [x] Telegram / 飞书渠道骨架
-- [x] Unitree 物理机器人适配器接口（运动为桩，待接 SDK）
+- [x] Unitree 物理机器人适配器（`unitree_sdk2_python` 实接：Move/RecoveryStand/StandDown/GetState，无硬件时自动降级桩模式）
 - [x] **多 Agent 编排**（Orchestrator + 路由）
 - [x] **LLM 本地 / 云端部署适配**（预设工厂 + `is_local`）
-- [ ] Unitree SDK 实际运动指令接入
-- [ ] MC bot 寻路与 chunk 订阅联调（算法已就绪）
+- [x] **Unitree SDK 实际运动指令接入**（unitree_sdk2_python SportClient）
+- [x] **MC bot chunk 订阅与寻路联调**（palette + packed bit array 解析 → World → A*）
+- [x] **一键部署脚本**（人话交互，自动选本地/云端 AI 并下载模型）
 
 ## 测试
 
 ```bash
-pytest -q          # 49 个测试（含 Web 渠道、LLM 部署适配）
+pytest -q          # 56 个测试（含 Web 渠道、LLM 部署、chunk 解析、寻路）
 ruff check src/ tests/
 ```
 
