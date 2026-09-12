@@ -39,6 +39,21 @@ OpenClaw 主体是 Node.js（pnpm workspace），适合云端/桌面。但树莓
 
 ### 安装
 
+#### 方式一：一键部署脚本（推荐，会自动问你本地还是云端 AI）
+
+```bash
+git clone https://github.com/1234567461/openclaw-robot.git
+cd openclaw-robot
+./deploy.sh
+```
+
+脚本会用人话一步步引导你选：
+1. 跑网页聊天还是 Minecraft 机器人
+2. AI 用本地（Ollama，自动下模型，可选模板或自定义模型名）还是云端（填 API Key）
+3. 自动写好 `.env`、装好依赖、启动服务
+
+#### 方式二：手动
+
 ```bash
 git clone https://github.com/1234567461/openclaw-robot.git
 cd openclaw-robot
