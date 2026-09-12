@@ -41,3 +41,7 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/openclaw_robot"]
+
+# 确保 mineflayer 桥接脚本（JS）随包发布，非 editable 安装也能找到
+[tool.hatch.build.targets.wheel.force-include]
+"src/openclaw_robot/minecraft/mineflayer_bridge.js" = "openclaw_robot/minecraft/mineflayer_bridge.js"

@@ -14,6 +14,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -31,15 +32,18 @@ class MinecraftBot:
     """一个 Minecraft 玩家 bot，通过 RCON 与服务器交互。
 
     配置通过环境变量：
-      MC_HOST, MC_RCON_PORT, MC_RCON_PASSWORD, MC_USERNAME
+      MC_HOST, MC_PORT, MC_RCON_PORT, MC_RCON_PASSWORD, MC_USERNAME, MC_VERSION
     RCON 需在 server.properties 开启（见模块 docstring）。
     """
 
     llm: LLM = field(default_factory=LLM)
     host: str = ""
+    port: int = 25565
     rcon_port: int = 25575
     rcon_password: str = ""
     username: str = "ClawBot"
+    # 显式指定 MC 协议版本；留空/auto 时桥接脚本先 ping 服务器自动探测
+    mc_version: str = ""
 
     # 运行时状态
     _rcon: Any = field(default=None, repr=False)
@@ -53,40 +57,53 @@ class MinecraftBot:
 
     def __post_init__(self) -> None:
         self.host = self.host or os.getenv("MC_HOST", "127.0.0.1")
+        self.port = int(os.getenv("MC_PORT", str(self.port)))
         self.rcon_port = int(os.getenv("MC_RCON_PORT", "25575"))
         self.rcon_password = os.getenv("MC_RCON_PASSWORD", "")
         self.username = os.getenv("MC_USERNAME", "ClawBot")
+        # 留空/auto = 桥接脚本先 ping 服务器自动探测版本，兼容 26.1/26.2 等
+        self.mc_version = os.getenv("MC_VERSION", self.mc_version or "auto")
         self._register_tools()
 
     # ---------- 工具注册 ----------
 
     def _register_tools(self) -> None:
         """把 bot 自身能力注册为 LLM 可调用的工具。"""
-        self._tools.register(Tool(
-            name="chat",
-            description="在游戏聊天里发言。message: 要说的内容。",
-            func=lambda message: self._do_chat(message),
-        ))
-        self._tools.register(Tool(
-            name="gather",
-            description="采集资源。resource: wood/stone/coal/iron/diamond，count: 数量。",
-            func=lambda resource="wood", count=1: self._do_gather(resource, count),
-        ))
-        self._tools.register(Tool(
-            name="build",
-            description="在坐标(x,y,z)建造结构。structure: hut/tower/torch。",
-            func=lambda structure, x, y, z: self._do_build(structure, x, y, z),
-        ))
-        self._tools.register(Tool(
-            name="look_around",
-            description="报告周围环境（前方方块）。",
-            func=lambda: self._look_around(),
-        ))
-        self._tools.register(Tool(
-            name="where",
-            description="报告自己当前坐标和状态。",
-            func=lambda: self._where(),
-        ))
+        self._tools.register(
+            Tool(
+                name="chat",
+                description="在游戏聊天里发言。message: 要说的内容。",
+                func=lambda message: self._do_chat(message),
+            )
+        )
+        self._tools.register(
+            Tool(
+                name="gather",
+                description="采集资源。resource: wood/stone/coal/iron/diamond，count: 数量。",
+                func=lambda resource="wood", count=1: self._do_gather(resource, count),
+            )
+        )
+        self._tools.register(
+            Tool(
+                name="build",
+                description="在坐标(x,y,z)建造结构。structure: hut/tower/torch。",
+                func=lambda structure, x, y, z: self._do_build(structure, x, y, z),
+            )
+        )
+        self._tools.register(
+            Tool(
+                name="look_around",
+                description="报告周围环境（前方方块）。",
+                func=lambda: self._look_around(),
+            )
+        )
+        self._tools.register(
+            Tool(
+                name="where",
+                description="报告自己当前坐标和状态。",
+                func=lambda: self._where(),
+            )
+        )
 
     # ---------- 工具实现 ----------
 
@@ -96,10 +113,12 @@ class MinecraftBot:
 
     def _do_gather(self, resource: str, count: int) -> str:
         from .skills.gather import gather
+
         return gather(self, resource, count)
 
     def _do_build(self, structure: str, x: float, y: float, z: float) -> str:
         from .skills.build import build
+
         return build(self, structure, x, y, z)
 
     def _look_around(self) -> str:
@@ -189,7 +208,9 @@ class MinecraftBot:
         self._refresh_state()
 
         world_state = WORLD_STATE_TEMPLATE.format(
-            x=self._position[0], y=self._position[1], z=self._position[2],
+            x=self._position[0],
+            y=self._position[1],
+            z=self._position[2],
             health=self._health,
             inventory=dict(list(self._inventory.items())[:5]) or "空",
             nearby_players=player,
@@ -244,18 +265,24 @@ class MinecraftBot:
     def _try_mineflayer(self) -> bool:
         """用 mineflayer（Node.js 桥接）作为真实玩家连接。
 
-        mineflayer 支持 MC 1.8~26.1，bot 是真实玩家实体（出现在玩家列表）。
-        26.2 等上游合并后再支持；现在用 26.1。
+        bot 是真实玩家实体（出现在玩家列表），通过同目录的
+        mineflayer_bridge.js 桥接：先 ping 服务器自动探测协议版本，
+        再以该版本登录；显式版本不对时自动回退到自动协商。
+        这样无需写死版本号即可连上 26.1 / 26.2 等服务器。
 
-        收到玩家聊天 → 写到 stdout（JSON）→ Python 读 stdout 回调 on_player_chat。
-        需要 Node.js + npm install mineflayer。
+        需要 Node.js + npm install mineflayer（minecraft-protocol 随附，
+        若未安装则 ping 失败时退化为不指定版本让 mineflayer 自行协商）。
         """
-        try:
-            import subprocess
+        import json
+        import subprocess
+        from pathlib import Path
 
+        try:
             result = subprocess.run(  # noqa: S603,S602
                 ["node", "-e", "require('mineflayer')"],
-                capture_output=True, timeout=3,
+                capture_output=True,
+                timeout=3,
+                cwd=str(Path(__file__).parent),
             )
             if result.returncode != 0:
                 log.info("mineflayer 未安装，回退 RCON")
@@ -267,67 +294,89 @@ class MinecraftBot:
             log.info("Node.js 检测超时，回退 RCON")
             return False
 
-        log.info("mineflayer 玩家模式连接 %s:25565（bot %s）", self.host, self.username)
-        # JS 脚本：连服务器，监听聊天，每行输出 JSON {user,msg}，收到指令调 LLM
-        script = (
-            "const mf=require('mineflayer');"
-            f"const b=mf.createBot({{host:'{self.host}',port:25565,"
-            f"username:'{self.username}',version:'26.1',auth:'offline'}});"
-            "b.on('spawn',()=>{b.chat('ClawBot 已上线');});"
-            "b.on('chat',(u,m)=>{"
-            "if(u!==b.username)console.log(JSON.stringify({user:u,msg:m}));"
-            "});"
-            "b.on('kicked',r=>console.error('kicked',r));"
-            "b.on('error',e=>console.error('error',e));"
-            "b.on('end',()=>console.error('disconnected'));"
-        )
-        try:
-            import subprocess as sp
-
-            self._mf_proc = sp.Popen(  # noqa: S603,S602
-                ["node", "-e", script],
-                stdout=sp.PIPE,
-                stderr=sp.PIPE,
-                text=True,
-            )
-            self._connected = True
-            log.info("mineflayer 玩家模式已启动（真实玩家实体，26.1）")
-            # 读 stdout，每行是一个聊天 JSON，回调 on_player_chat
-            import threading
-
-            def _read_chat() -> None:
-                assert self._mf_proc is not None
-                for line in self._mf_proc.stdout:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        import json
-
-                        data = json.loads(line)
-                        self.on_player_chat(data["user"], data["msg"])
-                    except Exception as e:  # noqa: BLE001
-                        log.debug("非 JSON 行: %s (%s)", line, e)
-
-            threading.Thread(target=_read_chat, daemon=True).start()
-            return True
-        except Exception as e:  # noqa: BLE001
-            log.warning("mineflayer 连接失败，回退 RCON: %s", e)
+        bridge = Path(__file__).parent / "mineflayer_bridge.js"
+        if not bridge.exists():
+            log.warning("桥接脚本缺失: %s，回退 RCON", bridge)
             return False
 
-    def connect(self) -> None:
-        """连接到 MC 服务器（26.1 优先玩家模式，回退 RCON/桩）。
+        log.info(
+            "mineflayer 玩家模式连接 %s:%d（bot=%s, version=%s）",
+            self.host,
+            self.port,
+            self.username,
+            self.mc_version or "auto",
+        )
+        try:
+            self._mf_proc = subprocess.Popen(  # noqa: S603,S602
+                [
+                    "node",
+                    str(bridge),
+                    self.host,
+                    str(self.port),
+                    self.username,
+                    self.mc_version or "auto",
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+        except Exception as e:  # noqa: BLE001
+            log.warning("启动桥接脚本失败，回退 RCON: %s", e)
+            return False
 
-        1. mineflayer 真实玩家模式（26.1，需 Node.js + npm install mineflayer）
-        2. RCON 后台模式（任意版本 26.2，需配 RCON 密码）
+        self._connected = True
+
+        # 持续抽干 stderr，防止管道写满导致 Node 进程阻塞
+        def _drain_stderr() -> None:
+            assert self._mf_proc is not None
+            for line in self._mf_proc.stderr:
+                log.debug("[mineflayer] %s", line.rstrip())
+
+        threading.Thread(target=_drain_stderr, daemon=True).start()
+
+        # 读 stdout，每行一个 JSON 事件
+        def _read_events() -> None:
+            assert self._mf_proc is not None
+            for line in self._mf_proc.stdout:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    data = json.loads(line)
+                except Exception as e:  # noqa: BLE001
+                    log.debug("非 JSON 行: %s (%s)", line, e)
+                    continue
+                etype = data.get("type")
+                if etype == "chat":
+                    self.on_player_chat(data.get("user", ""), data.get("message", ""))
+                elif etype == "ping":
+                    log.info("服务器协议版本: %s", data.get("version"))
+                elif etype == "spawn":
+                    log.info("mineflayer 已以真实玩家身份进服（bot=%s）", self.username)
+                elif etype == "kicked":
+                    log.warning("被服务器踢出: %s", data.get("reason"))
+                elif etype == "error":
+                    log.warning("mineflayer 错误: %s", data.get("err"))
+                elif etype == "end":
+                    log.warning("mineflayer 连接断开: %s", data.get("reason"))
+                    self._connected = False
+
+        threading.Thread(target=_read_events, daemon=True).start()
+        return True
+
+    def connect(self) -> None:
+        """连接到 MC 服务器（mineflayer 真实玩家模式优先，回退 RCON/桩）。
+
+        1. mineflayer 真实玩家模式（自动探测版本，需 Node.js + mineflayer）
+        2. RCON 后台模式（任意版本，需配 RCON 密码）
         3. 桩模式（不连服务器）
         """
-        # 1. mineflayer 真实玩家模式（26.1）
+        # 1. mineflayer 真实玩家模式
         if self._try_mineflayer():
             self._poll_loop()
             return
 
-        # 2. RCON 模式（支持 26.2 等任意版本，bot 是后台不是玩家实体）
+        # 2. RCON 模式（任意版本，bot 是后台不是玩家实体）
         if self.rcon_password:
             try:
                 from mcrcon import MCRcon  # type: ignore
@@ -350,7 +399,7 @@ class MinecraftBot:
 
         # 3. 桩模式
         log.warning("未配置 mineflayer 或 RCON，bot 运行在桩模式")
-        log.warning("装 Node.js + npm install mineflayer 启用玩家模式（26.1）")
+        log.warning("装 Node.js + npm install mineflayer 启用玩家模式")
 
     def _poll_loop(self, interval: float = 1.0) -> None:
         """轮询服务器日志监听聊天。

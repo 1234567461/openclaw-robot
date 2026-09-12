@@ -26,7 +26,7 @@
 
 OpenClaw 主体是 Node.js（pnpm workspace），适合云端/桌面。但树莓派 + Minecraft bot 场景下，Python 生态（`openai` SDK、`lark-oapi`）更顺手、更轻量。本仓库把 Gateway / Agent / 工具调度那一套用 Python 重写，并提供三种机器人形态的适配器。
 
-MC bot 用 **mineflayer**（Node.js 桥接）作为真实玩家连接服务器，bot 出现在玩家列表，能在游戏里聊天。支持 MC 1.8~**26.1**（26.2 等上游 mineflayer 合并后自动支持，或用 RCON 后台模式）。
+MC bot 用 **mineflayer**（Node.js 桥接）作为真实玩家连接服务器，bot 出现在玩家列表，能在游戏里聊天。桥接脚本启动时先 **ping 服务器自动探测协议版本**，再以该版本登录；显式版本不对时自动回退到 mineflayer 自动协商，因此可连 26.1 / 26.2 等服务器（也可用 RCON 后台模式）。
 
 ## 模块
 
@@ -144,11 +144,11 @@ tg.run()  # 阻塞监听
 
 ### 跑 Minecraft bot（重点）
 
-**mineflayer 真实玩家模式，支持 MC 26.1。bot 作为真实玩家进游戏，出现在玩家列表，零配置。**
+**mineflayer 真实玩家模式：bot 作为真实玩家进游戏，出现在玩家列表，自动探测服务器版本（26.1/26.2 均可），零配置。**
 
-> 26.2 上游 mineflayer 还没合并支持，用 26.1 即可（或用可选的 RCON 后台模式连 26.2）。
+> 桥接脚本启动时先 ping 服务器拿到真实协议版本再登录；如果指定版本不被 mineflayer 支持，会自动去掉版本号重试一次让 mineflayer 自行协商。一般不需要手填版本。
 
-1. 启动一个 MC 26.1 服务器（`online-mode=false` 离线模式最简单，可用本仓库的 [auto-deploy-linux](https://github.com/1234567461/auto-deploy-linux) 一键部署）
+1. 启动一个 MC 服务器（`online-mode=false` 离线模式最简单，可用本仓库的 [auto-deploy-linux](https://github.com/1234567461/auto-deploy-linux) 一键部署）
 2. 装 Node.js + mineflayer（`deploy.sh` 会自动装）：
    ```bash
    npm install mineflayer
@@ -156,7 +156,9 @@ tg.run()  # 阻塞监听
 3. 配置 `.env`：
    ```
    MC_HOST=127.0.0.1
+   MC_PORT=25565
    MC_USERNAME=ClawBot
+   MC_VERSION=auto        # auto = 自动探测服务器版本；也可写死如 1.21.4
    LLM_API_KEY=sk-xxx      # 云端；本地 Ollama 可留空
    ```
 4. 启动：
@@ -165,7 +167,7 @@ tg.run()  # 阻塞监听
    openclaw-mc --cli      # 桩模式本地调试（不连服务器）
    ```
 5. bot 作为真实玩家进游戏，收到玩家聊天 → LLM 理解 → 调用工具（采集/建造/对话）→ 在游戏里回复。
-6. **可选 RCON 模式**（不想装 Node.js，或服务器是 26.2）：设 `MC_RCON_PASSWORD`，bot 走后台执行命令。
+6. **可选 RCON 模式**（不想装 Node.js，或服务器版本 mineflayer 暂不支持）：设 `MC_RCON_PASSWORD`，bot 走后台执行命令。
 
 ### 多 Agent 编排
 
@@ -198,7 +200,7 @@ docker compose up -d
 ## 状态与路线图
 
 - [x] core Agent 框架（LLM + 记忆 + 工具调度 + Gateway）
-- [x] MC bot **mineflayer 真实玩家模式**（26.1）+ LLM 决策循环
+- [x] MC bot **mineflayer 真实玩家模式**（独立桥接脚本，ping 自动探测服务器版本，兼容 26.1/26.2）+ LLM 决策循环
 - [x] MC 世界快照（World 类：方块查询 / 最近方块 / 可通行判定）
 - [x] MC A* 寻路（3D 网格 + 跳跃/下落处理）
 - [x] MC 技能：采集 / 建造 / 对话
@@ -211,11 +213,12 @@ docker compose up -d
 - [x] **Unitree SDK 实际运动指令接入**（unitree_sdk2_python SportClient）
 - [x] **MC bot RCON 适配**（`/setblock` `/tp` `/tellraw` `/data get`，支持 1.26 等新版）
 - [x] **一键部署脚本**（人话交互，自动选本地/云端 AI 并下载模型）
+- [x] **mineflayer 桥接加固**（独立 `mineflayer_bridge.js`，版本自动探测 + 失败自动回退协商 + 结构化事件 + stderr 抽干防阻塞）
 
 ## 测试
 
 ```bash
-pytest -q          # 50 个测试（含 mineflayer 桥接、RCON、LLM 部署、寻路、Web 渠道）
+pytest -q          # 54 个测试（含 mineflayer 桥接、RCON、LLM 部署、寻路、Web 渠道）
 ruff check src/ tests/
 ```
 
