@@ -56,10 +56,14 @@ class LLM:
         self.api_base = self.api_base or os.getenv("LLM_API_BASE", "https://api.openai.com/v1")
         self.api_key = self.api_key or os.getenv("LLM_API_KEY", "")
         self.model = self.model or os.getenv("LLM_MODEL", "gpt-4o-mini")
+        # 本地后端（Ollama/vLLM）不校验 key，但 SDK 需要非空 → 自动填占位
         if not self.api_key:
-            raise RuntimeError(
-                "LLM_API_KEY 未设置：云端需真实 key，本地 Ollama 填任意非空值（如 'ollama'）"
-            )
+            if _is_local_base(self.api_base):
+                self.api_key = "local"  # Ollama/vLLM 通用占位
+            else:
+                raise RuntimeError(
+                    "LLM_API_KEY 未设置：云端需真实 key，本地 Ollama 可留空（自动填占位）"
+                )
 
     @classmethod
     def create(cls, preset: str, api_key: str = "", model: str = "") -> LLM:
@@ -81,7 +85,7 @@ class LLM:
     @property
     def is_local(self) -> bool:
         """是否为本地部署（localhost / 127.0.0.1）。"""
-        return "localhost" in self.api_base or "127.0.0.1" in self.api_base
+        return _is_local_base(self.api_base)
 
     def chat(
         self,
@@ -107,3 +111,8 @@ class LLM:
         """简单文本对话，返回 assistant 文本。"""
         r = self.chat([{"role": "system", "content": system}, {"role": "user", "content": prompt}])
         return r["choices"][0]["message"]["content"]
+
+
+def _is_local_base(api_base: str) -> bool:
+    """判断 API base 是否指向本地（Ollama/vLLM 等不需要真实 key）。"""
+    return "localhost" in api_base or "127.0.0.1" in api_base or "0.0.0.0" in api_base

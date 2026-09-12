@@ -78,3 +78,28 @@ def test_llm_env_var_config(monkeypatch):
     assert llm.api_key == "sk-ds"
     assert llm.model == "deepseek-chat"
     assert not llm.is_local
+
+
+def test_local_backend_no_key_autofill(monkeypatch):
+    """本地后端（Ollama/vLLM）即使没配 LLM_API_KEY 也能用，自动填占位 key。"""
+    monkeypatch.delenv("LLM_API_KEY", raising=False)
+    monkeypatch.setenv("LLM_API_BASE", "http://localhost:11434/v1")
+    monkeypatch.setenv("LLM_MODEL", "qwen2.5:7b")
+    llm = LLM()
+    assert llm.is_local
+    assert llm.api_key == "local"  # 自动填的占位，无需用户手动配
+
+
+def test_local_backend_127_autofill():
+    """127.0.0.1 也算本地，自动填占位 key。"""
+    llm = LLM(api_base="http://127.0.0.1:8000/v1", model="qwen2.5-7b")
+    assert llm.is_local
+    assert llm.api_key == "local"
+
+
+def test_cloud_backend_no_key_still_raises(monkeypatch):
+    """云端后端没配 key 仍报错（保护用户，避免白跑）。"""
+    monkeypatch.delenv("LLM_API_KEY", raising=False)
+    monkeypatch.setenv("LLM_API_BASE", "https://api.openai.com/v1")
+    with pytest.raises(RuntimeError, match="LLM_API_KEY"):
+        LLM()
