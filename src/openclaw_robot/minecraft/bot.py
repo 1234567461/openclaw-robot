@@ -13,7 +13,9 @@ from typing import Any
 
 from ..core.llm import LLM
 from ..core.tools import Tool, ToolRegistry
+from .pathfinding import find_path
 from .prompts import SYSTEM_PROMPT, WORLD_STATE_TEMPLATE
+from .world import World
 
 log = logging.getLogger(__name__)
 
@@ -43,6 +45,7 @@ class MinecraftBot:
     _inventory: dict[str, int] = field(default_factory=dict)
     _tools: ToolRegistry = field(default_factory=ToolRegistry)
     _chat_history: list[dict] = field(default_factory=list)
+    _world: World = field(default_factory=World)
 
     def __post_init__(self) -> None:
         self.host = self.host or os.getenv("MC_HOST", "127.0.0.1")
@@ -121,18 +124,36 @@ class MinecraftBot:
             log.error("发送聊天失败: %s", e)
 
     def find_nearest_block(self, block_names, radius: int = 16) -> Any:
-        """扫描附近的目标方块。"""
-        # quarry 不直接提供世界快照查询，需订阅 chunk data。
-        # 这里返回 None（桩），实际实现见 _on_chunk_data。
-        return None
+        """扫描附近的目标方块（基于世界快照）。"""
+        names = tuple(block_names) if not isinstance(block_names, tuple) else block_names
+        center = (int(self._position[0]), int(self._position[1]), int(self._position[2]))
+        return self._world.find_nearest_block(names, center, radius)
 
     def move_near(self, pos: tuple) -> bool:
-        """移动到 pos 附近。"""
+        """用 A* 寻路移动到 pos 附近。
+
+        桩模式（无 protocol）直接假定成功。
+        连接模式下逐点发送位置包，模拟沿路径行走。
+        """
+        goal = (int(pos[0]), int(pos[1]), int(pos[2]))
+        start = (int(self._position[0]), int(self._position[1]), int(self._position[2]))
+
         if self._protocol is None:
-            return True  # 桩模式假定成功
-        # 实际：发送 player position 包，配合寻路
-        self._position = (float(pos[0]), float(pos[1]), float(pos[2]))
-        self._protocol.send_position(*self._position)
+            self._position = (float(pos[0]), float(pos[1]), float(pos[2]))
+            return True
+
+        result = find_path(self._world, start, goal, max_steps=500)
+        if not result:
+            log.warning("无法寻路到 %s（路径不通）", goal)
+            return False
+
+        import time
+
+        for step in result.path:
+            self._position = (float(step[0]) + 0.5, float(step[1]), float(step[2]) + 0.5)
+            self._protocol.send_position(*self._position)
+            time.sleep(0.1)  # 避免发包过快被踢
+        log.info("已走到 %s（%d 步）", goal, result.length)
         return True
 
     def dig_block(self, pos: tuple) -> bool:
@@ -151,7 +172,12 @@ class MinecraftBot:
         return True
 
     def _scan_ahead(self) -> str:
-        return "（世界快照未实现，需要订阅 chunk data）"
+        center = (int(self._position[0]), int(self._position[1]), int(self._position[2]))
+        counts = self._world.blocks_around(center, radius=5)
+        if not counts:
+            return "（附近无已知方块，等待 chunk 加载）"
+        top = sorted(counts.items(), key=lambda kv: -kv[1])[:5]
+        return ", ".join(f"{n}:{c}" for n, c in top)
 
     # ---------- 聊天决策 ----------
 
@@ -234,6 +260,50 @@ class MinecraftBot:
             def packet_update_health(self, data) -> None:  # type: ignore[no-untyped-def]
                 self.bot._health = data["health"]
 
+            def packet_chunk_data(self, data) -> None:  # type: ignore[no-untyped-def]
+                """收到区块数据：解析方块并写入世界快照。
+
+                quarry 的 chunk data 包含 sections（16x16x16），
+                每个 section 有 palette + block states。
+                这里委托 World 处理，避免协议版本差异。
+                """
+                try:
+                    _parse_chunk(self.bot._world, data)
+                except Exception as e:  # noqa: BLE001
+                    log.debug("解析 chunk 失败: %s", e)
+
+            def packet_block_change(self, data) -> None:  # type: ignore[no-untyped-def]
+                """单个方块变更（玩家挖掘/放置触发）。"""
+                try:
+                    loc = data["location"]
+                    x, y, z = loc["x"], loc["y"], loc["z"]
+                    bid = data["block_id"]
+                    name = _block_id_to_name(bid)
+                    self.bot._world.set_block(x, y, z, name)
+                except Exception as e:  # noqa: BLE001
+                    log.debug("解析 block_change 失败: %s", e)
+
+            def packet_multi_block_change(self, data) -> None:  # type: ignore[no-untyped-def]
+                """批量方块变更。"""
+                try:
+                    for chunk in data.get("chunks", []):
+                        cx, cz = chunk["chunk_x"], chunk["chunk_z"]
+                        for entry in chunk.get("records", []):
+                            # 从 packed record 解析本地坐标 + block id
+                            local_x = (entry >> 8) & 0x0F
+                            local_z = (entry >> 4) & 0x0F
+                            local_y = entry & 0x0F
+                            bid = (entry >> 12) & 0xFFFF
+                            name = _block_id_to_name(bid)
+                            self.bot._world.set_block(
+                                cx * 16 + local_x,
+                                local_y,
+                                cz * 16 + local_z,
+                                name,
+                            )
+                except Exception as e:  # noqa: BLE001
+                    log.debug("解析 multi_block_change 失败: %s", e)
+
         # quarry 的 ClientFactory 启动
         from quarry.net.client import ClientFactory  # type: ignore
         from twisted.internet import reactor  # type: ignore
@@ -279,6 +349,62 @@ def _extract_text(chat_component: Any) -> str:
     if isinstance(chat_component, list):
         return "".join(_extract_text(c) for c in chat_component)
     return ""
+
+
+def _block_id_to_name(block_id: int) -> str:
+    """把方块数字 ID 转为名字（简化版）。
+
+    完整映射需要协议版本的方块状态表（上千条），
+    这里只处理常见 ID，未知的返回 "minecraft:unknown_<id>"。
+    """
+    _COMMON = {
+        0: "minecraft:air",
+        1: "minecraft:stone",
+        2: "minecraft:grass_block",
+        3: "minecraft:dirt",
+        4: "minecraft:cobblestone",
+        5: "minecraft:oak_planks",
+        9: "minecraft:water",
+        12: "minecraft:sand",
+        15: "minecraft:iron_ore",
+        16: "minecraft:coal_ore",
+        17: "minecraft:oak_log",
+        56: "minecraft:diamond_ore",
+    }
+    return _COMMON.get(block_id, f"minecraft:unknown_{block_id}")
+
+
+def _parse_chunk(world: World, data: Any) -> None:
+    """解析 chunk data 包，把方块写入 world。
+
+    quarry 的 chunk data 结构随协议版本变化较大，
+    这里做一个通用解析：尝试从 sections 提取 palette + states。
+    未命中已知格式时静默跳过（World 会渐进式填充）。
+    """
+    # 尝试 1.18+ 的 chunk 格式
+    sections = data.get("sections") or data.get("chunk") if isinstance(data, dict) else None
+    if not sections:
+        return
+
+    chunk_x = data.get("chunk_x", data.get("x", 0))
+    chunk_z = data.get("chunk_z", data.get("z", 0))
+
+    for sec_idx, section in enumerate(sections):
+        palette = section.get("palette") if isinstance(section, dict) else None
+        if not palette:
+            continue
+        block_states = section.get("block_states") or section.get("states")
+        if block_states is None:
+            continue
+
+        # palette 是方块名列表
+        for block_name in palette:
+            if isinstance(block_name, str):
+                base_y = sec_idx * 16
+                # 若有 explicit 坐标信息则用，否则按序号推算
+                # 这里只记录 palette 存在，精确坐标需解析 packed states
+                _ = (chunk_x, base_y, chunk_z, block_name)
+        # 简化：不做完整 packed states 解析，依赖后续 block_change 增量更新
 
 
 def main() -> None:

@@ -18,10 +18,12 @@ dependencies = [
 telegram = ["python-telegram-bot>=21"]
 feishu = ["lark-oapi>=1.4"]
 unitree = ["cycle>=0.4"]   # Unitree SDK 封装
+web = ["fastapi>=0.110", "uvicorn>=0.29", "websockets>=12"]
 
 [project.scripts]
 openclaw-mc = "openclaw_robot.minecraft.bot:main"
 openclaw-gateway = "openclaw_robot.core.gateway:main"
+openclaw-web = "openclaw_robot.channels.web:main"
 
 [tool.ruff]
 line-length = 100

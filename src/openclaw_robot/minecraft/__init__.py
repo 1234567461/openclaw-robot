@@ -5,5 +5,7 @@
 """
 
 from .bot import MinecraftBot
+from .pathfinding import find_path
+from .world import World
 
-__all__ = ["MinecraftBot"]
+__all__ = ["MinecraftBot", "World", "find_path"]
