@@ -10,7 +10,7 @@ dependencies = [
     "openai>=1.40",          # LLM provider（OpenAI 兼容）
     "httpx>=0.27",           # HTTP 客户端
     "pydantic>=2.7",         # 数据模型
-    "quarry>=1.6",           # 纯 Python Minecraft 协议库
+    "mcrcon>=0.7",           # Minecraft RCON 客户端（版本无关，1.9+ 通用）
     "cryptography>=43",      # 飞书加解密依赖
 ]
 

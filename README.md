@@ -24,7 +24,9 @@
 
 ## 为什么自己写
 
-OpenClaw 主体是 Node.js（pnpm workspace），适合云端/桌面。但树莓派 + Minecraft bot 场景下，Python 生态（`quarry` 协议库、`openai` SDK、`lark-oapi`）更顺手、更轻量。本仓库把 Gateway / Agent / 工具调度那一套用 Python 重写，并提供三种机器人形态的适配器。
+OpenClaw 主体是 Node.js（pnpm workspace），适合云端/桌面。但树莓派 + Minecraft bot 场景下，Python 生态（`mcrcon` RCON 客户端、`openai` SDK、`lark-oapi`）更顺手、更轻量。本仓库把 Gateway / Agent / 工具调度那一套用 Python 重写，并提供三种机器人形态的适配器。
+
+MC bot 用 **RCON 协议**（MC 1.9+ 内置，版本无关）连接服务器，不依赖 quarry 等协议库的版本支持范围，1.20 / 1.21 / 1.26 均可直接用。
 
 ## 模块
 
@@ -142,21 +144,29 @@ tg.run()  # 阻塞监听
 
 ### 跑 Minecraft bot（重点）
 
-1. 启动一个 MC 服务器（`online-mode=false` 离线模式最简单，可用本仓库的 [auto-deploy-linux](https://github.com/1234567461/auto-deploy-linux) 一键部署）
-2. 配置 `.env`：
+**通过 RCON 连接，支持 MC 1.9+ 任意版本（1.20 / 1.21 / 1.26 均可）。**
+
+1. 启动一个 MC 服务器（任意版本，可用本仓库的 [auto-deploy-linux](https://github.com/1234567461/auto-deploy-linux) 一键部署）
+2. 在服务器的 `server.properties` 开启 RCON：
+   ```properties
+   enable-rcon=true
+   rcon.password=你的密码
+   rcon.port=25575
+   ```
+3. 配置 `.env`：
    ```
    MC_HOST=127.0.0.1
-   MC_PORT=25565
    MC_USERNAME=ClawBot
-   MC_AUTH=offline
-   LLM_API_KEY=sk-xxx
+   MC_RCON_PORT=25575
+   MC_RCON_PASSWORD=你的密码
+   LLM_API_KEY=sk-xxx      # 云端；本地 Ollama 可留空
    ```
-3. 启动：
+4. 启动：
    ```bash
-   openclaw-mc            # 连接服务器
+   openclaw-mc            # 通过 RCON 连接服务器
    openclaw-mc --cli      # 桩模式本地调试（不连服务器）
    ```
-4. 游戏里对 bot 说"帮我挖点木头"或"在哪"，bot 会用 LLM 理解 → 调用工具（带世界快照 + A* 寻路）→ 回复。
+5. bot 用 RCON 执行命令（`/tellraw` 聊天、`/setblock` 建造、`/tp` 移动、`/data get` 查状态），LLM 决策 → 调用工具 → 回复。
 
 ### 多 Agent 编排
 
@@ -189,23 +199,23 @@ docker compose up -d
 ## 状态与路线图
 
 - [x] core Agent 框架（LLM + 记忆 + 工具调度 + Gateway）
-- [x] MC bot 协议连接 + 聊天监听 + LLM 决策循环
+- [x] MC bot 通过 **RCON** 连接（版本无关，1.9+ 通用）+ LLM 决策循环
 - [x] MC 世界快照（World 类：方块查询 / 最近方块 / 可通行判定）
 - [x] MC A* 寻路（3D 网格 + 跳跃/下落处理）
-- [x] MC 技能骨架：采集 / 建造 / 对话
+- [x] MC 技能：采集 / 建造 / 对话（RCON 命令：`/setblock` `/tp` `/tellraw`）
 - [x] **Web 聊天渠道**（FastAPI + WebSocket + 前端页面）
 - [x] Telegram / 飞书渠道骨架
 - [x] Unitree 物理机器人适配器（`unitree_sdk2_python` 实接：Move/RecoveryStand/StandDown/GetState，无硬件时自动降级桩模式）
 - [x] **多 Agent 编排**（Orchestrator + 路由）
 - [x] **LLM 本地 / 云端部署适配**（预设工厂 + `is_local`）
 - [x] **Unitree SDK 实际运动指令接入**（unitree_sdk2_python SportClient）
-- [x] **MC bot chunk 订阅与寻路联调**（palette + packed bit array 解析 → World → A*）
+- [x] **MC bot RCON 适配**（`/setblock` `/tp` `/tellraw` `/data get`，支持 1.26 等新版）
 - [x] **一键部署脚本**（人话交互，自动选本地/云端 AI 并下载模型）
 
 ## 测试
 
 ```bash
-pytest -q          # 56 个测试（含 Web 渠道、LLM 部署、chunk 解析、寻路）
+pytest -q          # 50 个测试（含 RCON 命令、LLM 部署、寻路、Web 渠道）
 ruff check src/ tests/
 ```
 

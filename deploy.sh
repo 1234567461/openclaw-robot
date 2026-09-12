@@ -140,11 +140,11 @@ LLM_MODEL=$MODEL
 WEB_HOST=0.0.0.0
 WEB_PORT=8080
 
-# ===== Minecraft bot =====
+# ===== Minecraft bot（RCON，需在 server.properties 开启 enable-rcon=true）=====
 MC_HOST=127.0.0.1
-MC_PORT=25565
 MC_USERNAME=ClawBot
-MC_AUTH=offline
+MC_RCON_PORT=25575
+MC_RCON_PASSWORD=
 EOF
 
   ok "环境配置已写入 .env（本地 Ollama + 模型 $MODEL）"
@@ -203,11 +203,11 @@ LLM_MODEL=$MODEL
 WEB_HOST=0.0.0.0
 WEB_PORT=8080
 
-# ===== Minecraft bot =====
+# ===== Minecraft bot（RCON，需在 server.properties 开启 enable-rcon=true）=====
 MC_HOST=127.0.0.1
-MC_PORT=25565
 MC_USERNAME=ClawBot
-MC_AUTH=offline
+MC_RCON_PORT=25575
+MC_RCON_PASSWORD=
 EOF
 
   ok "环境配置已写入 .env（云端 $CLOUD_PROVIDER + 模型 $MODEL）"
@@ -259,14 +259,15 @@ fi
 
 if [[ "$MODE" == "mc" || "$MODE" == "both" ]]; then
   echo ""
-  warn "注意：Minecraft 机器人需要一个运行中的 MC 服务器（online-mode=false）。"
+  warn "注意：Minecraft 机器人需要一个运行中的 MC 服务器（任意版本 1.9+）。"
+  warn "服务器需在 server.properties 开启 RCON：enable-rcon=true"
   MC_HOST=$(ask "MC 服务器地址" "127.0.0.1")
-  MC_PORT=$(ask "MC 服务器端口" "25565")
   MC_USERNAME=$(ask "机器人在游戏里的名字" "ClawBot")
+  MC_RCON_PASSWORD=$(ask "RCON 密码（server.properties 里的 rcon.password）")
 
   sed -i "s/^MC_HOST=.*/MC_HOST=$MC_HOST/" .env
-  sed -i "s/^MC_PORT=.*/MC_PORT=$MC_PORT/" .env
   sed -i "s/^MC_USERNAME=.*/MC_USERNAME=$MC_USERNAME/" .env
+  sed -i "s/^MC_RCON_PASSWORD=.*/MC_RCON_PASSWORD=$MC_RCON_PASSWORD/" .env
 
   info "启动 Minecraft 机器人..."
   exec openclaw-mc
