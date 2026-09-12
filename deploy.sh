@@ -140,11 +140,9 @@ LLM_MODEL=$MODEL
 WEB_HOST=0.0.0.0
 WEB_PORT=8080
 
-# ===== Minecraft bot（RCON，需在 server.properties 开启 enable-rcon=true）=====
+# ===== Minecraft bot（mineflayer 真实玩家模式，支持 26.1）=====
 MC_HOST=127.0.0.1
 MC_USERNAME=ClawBot
-MC_RCON_PORT=25575
-MC_RCON_PASSWORD=
 EOF
 
   ok "环境配置已写入 .env（本地 Ollama + 模型 $MODEL）"
@@ -203,11 +201,9 @@ LLM_MODEL=$MODEL
 WEB_HOST=0.0.0.0
 WEB_PORT=8080
 
-# ===== Minecraft bot（RCON，需在 server.properties 开启 enable-rcon=true）=====
+# ===== Minecraft bot（mineflayer 真实玩家模式，支持 26.1）=====
 MC_HOST=127.0.0.1
 MC_USERNAME=ClawBot
-MC_RCON_PORT=25575
-MC_RCON_PASSWORD=
 EOF
 
   ok "环境配置已写入 .env（云端 $CLOUD_PROVIDER + 模型 $MODEL）"
@@ -259,15 +255,44 @@ fi
 
 if [[ "$MODE" == "mc" || "$MODE" == "both" ]]; then
   echo ""
-  warn "注意：Minecraft 机器人需要一个运行中的 MC 服务器（任意版本 1.9+）。"
-  warn "服务器需在 server.properties 开启 RCON：enable-rcon=true"
+  info "Minecraft 机器人：mineflayer 真实玩家模式（支持 26.1）。"
+  echo "  bot 作为真实玩家进游戏，出现在玩家列表，零配置（离线模式）。"
+  echo ""
   MC_HOST=$(ask "MC 服务器地址" "127.0.0.1")
   MC_USERNAME=$(ask "机器人在游戏里的名字" "ClawBot")
-  MC_RCON_PASSWORD=$(ask "RCON 密码（server.properties 里的 rcon.password）")
 
   sed -i "s/^MC_HOST=.*/MC_HOST=$MC_HOST/" .env
   sed -i "s/^MC_USERNAME=.*/MC_USERNAME=$MC_USERNAME/" .env
-  sed -i "s/^MC_RCON_PASSWORD=.*/MC_RCON_PASSWORD=$MC_RCON_PASSWORD/" .env
+
+  # 自动装 Node.js + mineflayer（玩家模式依赖）
+  if ! command -v node &>/dev/null; then
+    info "检测到未装 Node.js，正在安装（mineflayer 玩家模式需要）..."
+    if command -v apt &>/dev/null; then
+      curl -fsSL https://deb.nodesource.com/setup_20.x | sudo bash - 2>/dev/null
+      sudo apt install -y nodejs 2>/dev/null || warn "apt 装 Node.js 失败，请手动装"
+    elif command -v dnf &>/dev/null; then
+      sudo dnf install -y nodejs 2>/dev/null || warn "dnf 装 Node.js 失败，请手动装"
+    elif command -v brew &>/dev/null; then
+      brew install node 2>/dev/null || warn "brew 装 Node.js 失败，请手动装"
+    else
+      warn "无法自动装 Node.js，请手动安装：https://nodejs.org"
+    fi
+  fi
+
+  if command -v node &>/dev/null; then
+    info "Node.js $(node -v) 已就绪"
+    if ! node -e "require('mineflayer')" 2>/dev/null; then
+      info "安装 mineflayer..."
+      npm install mineflayer 2>&1 | tail -3
+    fi
+    if node -e "require('mineflayer')" 2>/dev/null; then
+      info "mineflayer 就绪，bot 将作为真实玩家连接"
+    else
+      warn "mineflayer 安装失败，回退桩模式"
+    fi
+  else
+    warn "Node.js 未就绪，bot 将运行在桩模式（npm install mineflayer 后可用）"
+  fi
 
   info "启动 Minecraft 机器人..."
   exec openclaw-mc

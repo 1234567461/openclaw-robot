@@ -43,6 +43,7 @@ class MinecraftBot:
 
     # 运行时状态
     _rcon: Any = field(default=None, repr=False)
+    _mf_proc: Any = field(default=None, repr=False)  # mineflayer 子进程
     _connected: bool = False
     _position: tuple[float, float, float] = (0.0, 0.0, 0.0)
     _health: float = 20.0
@@ -240,31 +241,116 @@ class MinecraftBot:
 
     # ---------- 连接与主循环 ----------
 
-    def connect(self) -> None:
-        """通过 RCON 连接到 MC 服务器。"""
-        if not self.rcon_password:
-            log.warning("MC_RCON_PASSWORD 未设置，bot 运行在桩模式（不连服务器）")
-            return
+    def _try_mineflayer(self) -> bool:
+        """用 mineflayer（Node.js 桥接）作为真实玩家连接。
 
-        try:
-            from mcrcon import MCRcon  # type: ignore
-        except ImportError:
-            log.warning("mcrcon 未安装，bot 运行在桩模式（pip install mcrcon）")
-            return
+        mineflayer 支持 MC 1.8~26.1，bot 是真实玩家实体（出现在玩家列表）。
+        26.2 等上游合并后再支持；现在用 26.1。
 
-        log.info("RCON 连接 %s:%d（bot %s）", self.host, self.rcon_port, self.username)
+        收到玩家聊天 → 写到 stdout（JSON）→ Python 读 stdout 回调 on_player_chat。
+        需要 Node.js + npm install mineflayer。
+        """
         try:
-            self._rcon = MCRcon(self.host, self.rcon_password, port=self.rcon_port)
-            self._rcon.connect()
+            import subprocess
+
+            result = subprocess.run(  # noqa: S603,S602
+                ["node", "-e", "require('mineflayer')"],
+                capture_output=True, timeout=3,
+            )
+            if result.returncode != 0:
+                log.info("mineflayer 未安装，回退 RCON")
+                return False
+        except FileNotFoundError:
+            log.info("Node.js 未安装，回退 RCON")
+            return False
+        except subprocess.TimeoutExpired:
+            log.info("Node.js 检测超时，回退 RCON")
+            return False
+
+        log.info("mineflayer 玩家模式连接 %s:25565（bot %s）", self.host, self.username)
+        # JS 脚本：连服务器，监听聊天，每行输出 JSON {user,msg}，收到指令调 LLM
+        script = (
+            "const mf=require('mineflayer');"
+            f"const b=mf.createBot({{host:'{self.host}',port:25565,"
+            f"username:'{self.username}',version:'26.1',auth:'offline'}});"
+            "b.on('spawn',()=>{b.chat('ClawBot 已上线');});"
+            "b.on('chat',(u,m)=>{"
+            "if(u!==b.username)console.log(JSON.stringify({user:u,msg:m}));"
+            "});"
+            "b.on('kicked',r=>console.error('kicked',r));"
+            "b.on('error',e=>console.error('error',e));"
+            "b.on('end',()=>console.error('disconnected'));"
+        )
+        try:
+            import subprocess as sp
+
+            self._mf_proc = sp.Popen(  # noqa: S603,S602
+                ["node", "-e", script],
+                stdout=sp.PIPE,
+                stderr=sp.PIPE,
+                text=True,
+            )
             self._connected = True
-            log.info("RCON 已连接")
-            # 刷新状态
-            self._refresh_state()
-            # 监听聊天（轮询 /list 或外部桥接）
-            self._poll_loop()
+            log.info("mineflayer 玩家模式已启动（真实玩家实体，26.1）")
+            # 读 stdout，每行是一个聊天 JSON，回调 on_player_chat
+            import threading
+
+            def _read_chat() -> None:
+                assert self._mf_proc is not None
+                for line in self._mf_proc.stdout:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        import json
+
+                        data = json.loads(line)
+                        self.on_player_chat(data["user"], data["msg"])
+                    except Exception as e:  # noqa: BLE001
+                        log.debug("非 JSON 行: %s (%s)", line, e)
+
+            threading.Thread(target=_read_chat, daemon=True).start()
+            return True
         except Exception as e:  # noqa: BLE001
-            log.error("RCON 连接失败: %s", e)
-            self._connected = False
+            log.warning("mineflayer 连接失败，回退 RCON: %s", e)
+            return False
+
+    def connect(self) -> None:
+        """连接到 MC 服务器（26.1 优先玩家模式，回退 RCON/桩）。
+
+        1. mineflayer 真实玩家模式（26.1，需 Node.js + npm install mineflayer）
+        2. RCON 后台模式（任意版本 26.2，需配 RCON 密码）
+        3. 桩模式（不连服务器）
+        """
+        # 1. mineflayer 真实玩家模式（26.1）
+        if self._try_mineflayer():
+            self._poll_loop()
+            return
+
+        # 2. RCON 模式（支持 26.2 等任意版本，bot 是后台不是玩家实体）
+        if self.rcon_password:
+            try:
+                from mcrcon import MCRcon  # type: ignore
+            except ImportError:
+                log.warning("mcrcon 未安装，bot 运行在桩模式")
+                return
+
+            log.info("RCON 连接 %s:%d", self.host, self.rcon_port)
+            try:
+                self._rcon = MCRcon(self.host, self.rcon_password, port=self.rcon_port)
+                self._rcon.connect()
+                self._connected = True
+                log.info("RCON 已连接")
+                self._refresh_state()
+                self._poll_loop()
+            except Exception as e:  # noqa: BLE001
+                log.error("RCON 连接失败: %s", e)
+                self._connected = False
+            return
+
+        # 3. 桩模式
+        log.warning("未配置 mineflayer 或 RCON，bot 运行在桩模式")
+        log.warning("装 Node.js + npm install mineflayer 启用玩家模式（26.1）")
 
     def _poll_loop(self, interval: float = 1.0) -> None:
         """轮询服务器日志监听聊天。
@@ -297,14 +383,21 @@ class MinecraftBot:
                 self.on_player_chat("Tester", line)
 
     def disconnect(self) -> None:
-        """断开 RCON。"""
+        """断开连接（RCON 和 mineflayer 子进程都清理）。"""
+        if self._mf_proc:
+            try:
+                self._mf_proc.terminate()
+                self._mf_proc.wait(timeout=3)
+            except Exception:  # noqa: BLE001
+                pass
+            self._mf_proc = None
         if self._rcon:
             try:
                 self._rcon.disconnect()
             except Exception:  # noqa: BLE001
                 pass
         self._connected = False
-        log.info("RCON 已断开")
+        log.info("已断开")
 
 
 def main() -> None:

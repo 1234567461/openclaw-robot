@@ -24,9 +24,9 @@
 
 ## 为什么自己写
 
-OpenClaw 主体是 Node.js（pnpm workspace），适合云端/桌面。但树莓派 + Minecraft bot 场景下，Python 生态（`mcrcon` RCON 客户端、`openai` SDK、`lark-oapi`）更顺手、更轻量。本仓库把 Gateway / Agent / 工具调度那一套用 Python 重写，并提供三种机器人形态的适配器。
+OpenClaw 主体是 Node.js（pnpm workspace），适合云端/桌面。但树莓派 + Minecraft bot 场景下，Python 生态（`openai` SDK、`lark-oapi`）更顺手、更轻量。本仓库把 Gateway / Agent / 工具调度那一套用 Python 重写，并提供三种机器人形态的适配器。
 
-MC bot 用 **RCON 协议**（MC 1.9+ 内置，版本无关）连接服务器，不依赖 quarry 等协议库的版本支持范围，1.20 / 1.21 / 1.26 均可直接用。
+MC bot 用 **mineflayer**（Node.js 桥接）作为真实玩家连接服务器，bot 出现在玩家列表，能在游戏里聊天。支持 MC 1.8~**26.1**（26.2 等上游 mineflayer 合并后自动支持，或用 RCON 后台模式）。
 
 ## 模块
 
@@ -144,29 +144,28 @@ tg.run()  # 阻塞监听
 
 ### 跑 Minecraft bot（重点）
 
-**通过 RCON 连接，支持 MC 1.9+ 任意版本（1.20 / 1.21 / 1.26 均可）。**
+**mineflayer 真实玩家模式，支持 MC 26.1。bot 作为真实玩家进游戏，出现在玩家列表，零配置。**
 
-1. 启动一个 MC 服务器（任意版本，可用本仓库的 [auto-deploy-linux](https://github.com/1234567461/auto-deploy-linux) 一键部署）
-2. 在服务器的 `server.properties` 开启 RCON：
-   ```properties
-   enable-rcon=true
-   rcon.password=你的密码
-   rcon.port=25575
+> 26.2 上游 mineflayer 还没合并支持，用 26.1 即可（或用可选的 RCON 后台模式连 26.2）。
+
+1. 启动一个 MC 26.1 服务器（`online-mode=false` 离线模式最简单，可用本仓库的 [auto-deploy-linux](https://github.com/1234567461/auto-deploy-linux) 一键部署）
+2. 装 Node.js + mineflayer（`deploy.sh` 会自动装）：
+   ```bash
+   npm install mineflayer
    ```
 3. 配置 `.env`：
    ```
    MC_HOST=127.0.0.1
    MC_USERNAME=ClawBot
-   MC_RCON_PORT=25575
-   MC_RCON_PASSWORD=你的密码
    LLM_API_KEY=sk-xxx      # 云端；本地 Ollama 可留空
    ```
 4. 启动：
    ```bash
-   openclaw-mc            # 通过 RCON 连接服务器
+   openclaw-mc            # mineflayer 真实玩家模式连接
    openclaw-mc --cli      # 桩模式本地调试（不连服务器）
    ```
-5. bot 用 RCON 执行命令（`/tellraw` 聊天、`/setblock` 建造、`/tp` 移动、`/data get` 查状态），LLM 决策 → 调用工具 → 回复。
+5. bot 作为真实玩家进游戏，收到玩家聊天 → LLM 理解 → 调用工具（采集/建造/对话）→ 在游戏里回复。
+6. **可选 RCON 模式**（不想装 Node.js，或服务器是 26.2）：设 `MC_RCON_PASSWORD`，bot 走后台执行命令。
 
 ### 多 Agent 编排
 
@@ -199,10 +198,11 @@ docker compose up -d
 ## 状态与路线图
 
 - [x] core Agent 框架（LLM + 记忆 + 工具调度 + Gateway）
-- [x] MC bot 通过 **RCON** 连接（版本无关，1.9+ 通用）+ LLM 决策循环
+- [x] MC bot **mineflayer 真实玩家模式**（26.1）+ LLM 决策循环
 - [x] MC 世界快照（World 类：方块查询 / 最近方块 / 可通行判定）
 - [x] MC A* 寻路（3D 网格 + 跳跃/下落处理）
-- [x] MC 技能：采集 / 建造 / 对话（RCON 命令：`/setblock` `/tp` `/tellraw`）
+- [x] MC 技能：采集 / 建造 / 对话
+- [x] **RCON 后台模式**（26.2 可选，bot 不在玩家列表但能执行命令）
 - [x] **Web 聊天渠道**（FastAPI + WebSocket + 前端页面）
 - [x] Telegram / 飞书渠道骨架
 - [x] Unitree 物理机器人适配器（`unitree_sdk2_python` 实接：Move/RecoveryStand/StandDown/GetState，无硬件时自动降级桩模式）
@@ -215,7 +215,7 @@ docker compose up -d
 ## 测试
 
 ```bash
-pytest -q          # 50 个测试（含 RCON 命令、LLM 部署、寻路、Web 渠道）
+pytest -q          # 50 个测试（含 mineflayer 桥接、RCON、LLM 部署、寻路、Web 渠道）
 ruff check src/ tests/
 ```
 
